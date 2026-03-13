@@ -12,12 +12,19 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/andybalholm/cascadia"
+	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/batch"
+	E "github.com/sagernet/sing/common/exceptions"
+	F "github.com/sagernet/sing/common/format"
+	"github.com/sagernet/sing/service"
 	"golang.org/x/net/html"
 )
 
@@ -61,8 +68,6 @@ var (
 	anchorSel = mustSelector(anchorSelector)
 	bodySelHT = mustSelector(htmlBodySelector)
 )
-
-type ctxKey struct{}
 
 type itemEntry struct {
 	Title   string
@@ -117,27 +122,21 @@ func newHTTPClient() *http.Client {
 	}
 }
 
-func contextWithClient(ctx context.Context, client *http.Client) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, ctxKey{}, client)
-}
-
 func clientFromContext(ctx context.Context) *http.Client {
 	if ctx == nil {
 		return http.DefaultClient
 	}
-	if client, ok := ctx.Value(ctxKey{}).(*http.Client); ok && client != nil {
-		return client
+	client := service.FromContext[*http.Client](ctx)
+	if client == nil {
+		return http.DefaultClient
 	}
-	return http.DefaultClient
+	return client
 }
 
 func readResponseBody(resp *http.Response) ([]byte, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		return nil, E.New("status ", resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
 }
@@ -158,13 +157,13 @@ func pullBytes(ctx context.Context, target string) ([]byte, error) {
 	delay := pauseBase
 	var lastErr error
 
-	for attempt := 0; attempt < retries; attempt++ {
+	for attempt := range retries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
-			return nil, fmt.Errorf("request build: %w", err)
+			return nil, E.Cause(err, "request build")
 		}
 		for k, v := range baseHeaders {
 			req.Header.Set(k, v)
@@ -190,7 +189,7 @@ func pullBytes(ctx context.Context, target string) ([]byte, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("acquisition failure: %w", lastErr)
+	return nil, E.Cause(lastErr, "acquisition failure")
 }
 
 func pullIndex(ctx context.Context, day string) ([]string, error) {
@@ -275,46 +274,22 @@ func pullBatch(ctx context.Context, links []string) []itemEntry {
 		return nil
 	}
 
-	limit := maxConcurrent
-	if total < limit {
-		limit = total
-	}
-	if limit < 1 {
-		limit = 1
-	}
+	limit := max(common.Min(total, maxConcurrent), 1)
 
 	results := make([]itemEntry, total)
-	jobs := make(chan struct {
-		idx  int
-		link string
-	})
-
-	var wg sync.WaitGroup
-	wg.Add(limit)
-	for i := 0; i < limit; i++ {
-		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
-				results[job.idx] = pullItem(ctx, job.link)
-			}
-		}()
-	}
-
+	b, batchCtx := batch.New(ctx, batch.WithConcurrencyNum[itemEntry](limit))
 	for i, link := range links {
-		if ctx.Err() != nil {
-			break
-		}
-		jobs <- struct {
-			idx  int
-			link string
-		}{idx: i, link: link}
+		key := strconv.Itoa(i)
+		b.Go(key, func() (itemEntry, error) {
+			return pullItem(batchCtx, link), nil
+		})
 	}
-	close(jobs)
-	wg.Wait()
-
+	res, _ := b.WaitAndGetResult()
+	for i := range total {
+		if entry, ok := res[strconv.Itoa(i)]; ok {
+			results[i] = entry.Value
+		}
+	}
 	return results
 }
 
@@ -430,13 +405,7 @@ func computeDaysToFetch(today string, seen map[string]struct{}) []string {
 	if len(days) == 0 {
 		return []string{today}
 	}
-	foundToday := false
-	for _, d := range days {
-		if d == today {
-			foundToday = true
-			break
-		}
-	}
+	foundToday := slices.Contains(days, today)
 	if !foundToday {
 		days = append(days, today)
 	}
@@ -445,7 +414,7 @@ func computeDaysToFetch(today string, seen map[string]struct{}) []string {
 
 func processDay(ctx context.Context, day string) error {
 	if len(day) < 8 {
-		return fmt.Errorf("invalid date: %s", day)
+		return E.New("invalid date: ", day)
 	}
 	yearDir := filepath.Join(rootDir, day[:4])
 	docPath := filepath.Join(yearDir, day+".md")
@@ -517,7 +486,8 @@ func main() {
 	}
 
 	client := newHTTPClient()
-	ctx := contextWithClient(context.Background(), client)
+	ctx := service.ContextWithDefaultRegistry(context.Background())
+	ctx = service.ContextWith(ctx, client)
 
 	for _, day := range days {
 		if err := processDay(ctx, day); err != nil {
@@ -719,7 +689,7 @@ func (l *stderrLogger) write(args ...any) {
 	if l == nil {
 		return
 	}
-	msg := fmt.Sprint(args...)
+	msg := F.ToString(args...)
 	if msg == "" {
 		return
 	}

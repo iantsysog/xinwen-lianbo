@@ -25,9 +25,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: |
-          set -euo pipefail
-          go run .
+      - uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: |
+            set -euo pipefail
+            go run .
       - run: |
           set -euo pipefail
           git config --local user.email "github-actions[bot]@users.noreply.github.com"

@@ -21,4 +21,4 @@ updates:
       - "dependencies"
     open-pull-requests-limit: 3
     commit-message:
-      prefix: "deps(main)"
+      prefix: "deps(go)"

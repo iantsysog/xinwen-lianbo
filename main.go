@@ -28,6 +28,7 @@ const (
 	indexDateLayout  = "20060102"
 	stampLayout      = "2006-01-02 15:04"
 	htmlBodyTag      = "body"
+	insertMarker     = "<!-- INSERT -->"
 	maxConcurrent    = 64
 	httpTimeout      = 5 * time.Second
 	maxIdleConns     = 256
@@ -121,6 +122,11 @@ func readResponseBody(resp *http.Response) ([]byte, error) {
 }
 
 func pullBytes(ctx context.Context, client *http.Client, target string) ([]byte, error) {
+	parsed, err := url.Parse(target)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return nil, fmt.Errorf("invalid target url: %q", target)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request build: %w", err)
@@ -197,11 +203,11 @@ func pullBatch(ctx context.Context, client *http.Client, links []string) []itemE
 	for i, link := range links {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func() {
+		go func(i int, link string) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			results[i] = pullItem(ctx, client, link)
-			<-sem
-		}()
+		}(i, link)
 	}
 	wg.Wait()
 	return results
@@ -246,17 +252,16 @@ func syncCatalog(day string, docPath string) error {
 		}
 		return err
 	}
-	marker := "<!-- INSERT -->"
 	relative, err := filepath.Rel(rootDir, docPath)
 	if err != nil {
 		return err
 	}
 	record := fmt.Sprintf("- [%s](./%s)", day, filepath.ToSlash(relative))
 	readme := string(readmePayload)
-	if strings.Contains(readme, record) || !strings.Contains(readme, marker) {
+	if strings.Contains(readme, record) || !strings.Contains(readme, insertMarker) {
 		return nil
 	}
-	updated := strings.Replace(readme, marker, marker+"\n"+record, 1)
+	updated := strings.Replace(readme, insertMarker, insertMarker+"\n"+record, 1)
 	tmpPath := readmePath + ".tmp"
 	if err := os.WriteFile(tmpPath, []byte(updated), 0o644); err != nil {
 		return err
@@ -304,7 +309,7 @@ func computeDaysToFetch(today string, seen map[string]struct{}) []string {
 	if len(days) == 0 {
 		return []string{today}
 	}
-	if !contains(days, today) {
+	if !slices.Contains(days, today) {
 		days = append(days, today)
 	}
 	return days
@@ -450,7 +455,17 @@ func collectLinks(root *html.Node, baseURL string) ([]string, error) {
 			if err != nil {
 				return false
 			}
-			absolute := base.ResolveReference(ref).String()
+			resolved := base.ResolveReference(ref)
+			if resolved == nil {
+				return false
+			}
+			if resolved.Scheme != "http" && resolved.Scheme != "https" {
+				return false
+			}
+			if resolved.Host == "" {
+				return false
+			}
+			absolute := resolved.String()
 			if _, exists := seen[absolute]; exists {
 				return false
 			}
@@ -682,8 +697,4 @@ func isHeadingLine(line string) bool {
 		return false
 	}
 	return true
-}
-
-func contains(list []string, v string) bool {
-	return slices.Contains(list, v)
 }

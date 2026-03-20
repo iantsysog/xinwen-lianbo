@@ -192,10 +192,7 @@ func pullBatch(ctx context.Context, client *http.Client, links []string) []itemE
 	if total == 0 {
 		return nil
 	}
-	limit := max(maxConcurrent, 1)
-	if total < limit {
-		limit = total
-	}
+	limit := min(total, max(maxConcurrent, 1))
 
 	results := make([]itemEntry, total)
 	sem := make(chan struct{}, limit)

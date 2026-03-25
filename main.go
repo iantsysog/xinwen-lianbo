@@ -604,6 +604,25 @@ func renderNode(out *strings.Builder, node *html.Node, listDepth int, inPre bool
 			out.WriteString("**")
 			renderNode(out, c, listDepth, inPre, inCode)
 			out.WriteString("**")
+		case "em", "i":
+			out.WriteString("*")
+			renderNode(out, c, listDepth, inPre, inCode)
+			out.WriteString("*")
+		case "blockquote":
+			out.WriteString("\n> ")
+			renderNode(out, c, listDepth, inPre, inCode)
+			out.WriteString("\n")
+		case "table":
+			out.WriteString("\n")
+			renderNode(out, c, listDepth, inPre, inCode)
+			out.WriteString("\n")
+		case "tr":
+			out.WriteString("| ")
+			renderNode(out, c, listDepth, inPre, inCode)
+			out.WriteString(" |\n")
+		case "td", "th":
+			renderNode(out, c, listDepth, inPre, inCode)
+			out.WriteString(" | ")
 		case "pre":
 			out.WriteString("\n```\n")
 			renderNode(out, c, listDepth, true, true)

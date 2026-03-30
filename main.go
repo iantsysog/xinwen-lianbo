@@ -7,16 +7,19 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/html"
@@ -34,11 +37,10 @@ const (
 	maxIdleConns     = 256
 	maxIdlePerHost   = 128
 	keepAliveTimeout = 30 * time.Second
+	maxBodyBytes     = 32 << 20
 )
 
 var (
-	rootDir        string
-	readmePath     string
 	utc8           = time.FixedZone("UTC+8", 8*60*60)
 	titleCleanup   = []string{"[视频]", "[Video]"}
 	shtmlPattern   = ".shtml"
@@ -63,13 +65,10 @@ type itemEntry struct {
 	Link    string
 }
 
-func init() {
-	cwd, err := os.Getwd()
-	if err != nil || cwd == "" {
-		cwd = "."
-	}
-	rootDir = mustAbs(cwd)
-	readmePath = filepath.Join(rootDir, readmeFileName)
+type app struct {
+	rootDir    string
+	readmePath string
+	client     *http.Client
 }
 
 func mustAbs(path string) string {
@@ -99,13 +98,18 @@ func timetag(now time.Time) string {
 }
 
 func newHTTPClient() *http.Client {
-	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: keepAliveTimeout,
+	}
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           dialer.DialContext,
+		MaxConnsPerHost:       maxConcurrent,
 		MaxIdleConns:          maxIdleConns,
 		MaxIdleConnsPerHost:   maxIdlePerHost,
 		IdleConnTimeout:       keepAliveTimeout,
+		ResponseHeaderTimeout: 5 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
@@ -115,10 +119,10 @@ func newHTTPClient() *http.Client {
 
 func readResponseBody(resp *http.Response) ([]byte, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, resp.Body)
+		_, _ = io.CopyN(io.Discard, resp.Body, 4096)
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	return io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 }
 
 func pullBytes(ctx context.Context, client *http.Client, target string) ([]byte, error) {
@@ -126,6 +130,9 @@ func pullBytes(ctx context.Context, client *http.Client, target string) ([]byte,
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return nil, fmt.Errorf("invalid target url: %q", target)
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
+	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
@@ -148,6 +155,9 @@ func pullIndex(ctx context.Context, client *http.Client, day string) ([]string, 
 	target := fmt.Sprintf(indexURLTemplate, day)
 	payload, err := pullBytes(ctx, client, target)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		fmt.Fprintln(os.Stderr, "pull index:", err)
 		return nil, nil
 	}
@@ -192,12 +202,16 @@ func pullBatch(ctx context.Context, client *http.Client, links []string) []itemE
 	if total == 0 {
 		return nil
 	}
-	limit := min(total, max(maxConcurrent, 1))
+	limit := max(min(total, maxConcurrent), 1)
 
 	results := make([]itemEntry, total)
 	sem := make(chan struct{}, limit)
 	var wg sync.WaitGroup
+
 	for i, link := range links {
+		if ctx.Err() != nil {
+			break
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int, link string) {
@@ -241,15 +255,15 @@ func renderMarkdown(items []itemEntry) string {
 	return b.String()
 }
 
-func syncCatalog(day string, docPath string) error {
-	readmePayload, err := os.ReadFile(readmePath)
+func (a *app) syncCatalog(day string, docPath string) error {
+	readmePayload, err := os.ReadFile(a.readmePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		return err
 	}
-	relative, err := filepath.Rel(rootDir, docPath)
+	relative, err := filepath.Rel(a.rootDir, docPath)
 	if err != nil {
 		return err
 	}
@@ -259,11 +273,7 @@ func syncCatalog(day string, docPath string) error {
 		return nil
 	}
 	updated := strings.Replace(readme, insertMarker, insertMarker+"\n"+record, 1)
-	tmpPath := readmePath + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(updated), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, readmePath)
+	return writeFileAtomic(a.readmePath, []byte(updated), 0o644)
 }
 
 func computeDaysToFetch(today string, seen map[string]struct{}) []string {
@@ -312,41 +322,51 @@ func computeDaysToFetch(today string, seen map[string]struct{}) []string {
 	return days
 }
 
-func processDay(ctx context.Context, client *http.Client, day string) error {
+func (a *app) processDay(ctx context.Context, day string) error {
 	if len(day) < 8 {
 		return fmt.Errorf("invalid date: %s", day)
 	}
-	yearDir := filepath.Join(rootDir, day[:4])
+	yearDir := filepath.Join(a.rootDir, day[:4])
 	docPath := filepath.Join(yearDir, day+".md")
 	if err := os.MkdirAll(yearDir, 0o755); err != nil {
 		return err
 	}
-	links, err := pullIndex(ctx, client, day)
+
+	links, err := pullIndex(ctx, a.client, day)
 	if err != nil {
 		return err
 	}
 	if len(links) == 0 {
 		return nil
 	}
-	items := pullBatch(ctx, client, links)
+
+	items := pullBatch(ctx, a.client, links)
 	if len(items) == 0 {
 		return nil
 	}
+
 	content := formatMarkdown([]byte(renderMarkdown(items)))
-	tmpPath := docPath + ".tmp"
-	if err := os.WriteFile(tmpPath, content, 0o644); err != nil {
+	if err := writeFileAtomic(docPath, content, 0o644); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, docPath); err != nil {
-		return err
-	}
-	return syncCatalog(day, docPath)
+	return a.syncCatalog(day, docPath)
 }
 
 func main() {
 	var dateFlag string
 	flag.StringVar(&dateFlag, "date", "", "date in YYYYMMDD")
 	flag.Parse()
+
+	cwd, err := os.Getwd()
+	if err != nil || cwd == "" {
+		cwd = "."
+	}
+	rootDir := mustAbs(cwd)
+	a := &app{
+		rootDir:    rootDir,
+		readmePath: filepath.Join(rootDir, readmeFileName),
+		client:     newHTTPClient(),
+	}
 
 	today := datecode(time.Time{})
 	if dateFlag != "" {
@@ -358,15 +378,17 @@ func main() {
 		}
 	}
 
-	seen, err := seenDatesFromReadme(readmePath)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	seen, err := seenDatesFromReadme(a.readmePath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
-	client := newHTTPClient()
-	ctx := context.Background()
+
 	for _, day := range computeDaysToFetch(today, seen) {
-		if err := processDay(ctx, client, day); err != nil {
+		if err := a.processDay(ctx, day); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
@@ -405,16 +427,17 @@ func textContent(node *html.Node) string {
 		return ""
 	}
 	var b strings.Builder
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
+	stack := []*html.Node{node}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 		if n.Type == html.TextNode {
 			b.WriteString(n.Data)
 		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+		for c := n.LastChild; c != nil; c = c.PrevSibling {
+			stack = append(stack, c)
 		}
 	}
-	walk(node)
 	return strings.TrimSpace(strings.Join(strings.Fields(b.String()), " "))
 }
 
@@ -639,6 +662,51 @@ func renderNode(out *strings.Builder, node *html.Node, listDepth int, inPre bool
 			renderNode(out, c, listDepth, inPre, inCode)
 		}
 	}
+}
+
+func writeFileAtomic(path string, data []byte, perm fs.FileMode) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	f, err := os.CreateTemp(dir, base+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := f.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+
+	df, err := os.Open(dir)
+	if err != nil {
+		return nil
+	}
+	defer df.Close()
+	_ = df.Sync()
+	return nil
 }
 
 func formatMarkdown(input []byte) []byte {

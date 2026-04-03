@@ -63,6 +63,7 @@ type itemEntry struct {
 	Title   string
 	Payload []byte
 	Link    string
+	Err     error
 }
 
 type app struct {
@@ -158,8 +159,7 @@ func pullIndex(ctx context.Context, client *http.Client, day string) ([]string, 
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		fmt.Fprintln(os.Stderr, "pull index:", err)
-		return nil, nil
+		return nil, fmt.Errorf("pull index %s: %w", day, err)
 	}
 
 	root, err := html.Parse(bytes.NewReader(payload))
@@ -173,11 +173,11 @@ func pullIndex(ctx context.Context, client *http.Client, day string) ([]string, 
 func pullItem(ctx context.Context, client *http.Client, link string) itemEntry {
 	payload, err := pullBytes(ctx, client, link)
 	if err != nil {
-		return itemEntry{Link: link}
+		return itemEntry{Link: link, Err: fmt.Errorf("pull item: %w", err)}
 	}
 	root, err := html.Parse(bytes.NewReader(payload))
 	if err != nil {
-		return itemEntry{Link: link}
+		return itemEntry{Link: link, Err: fmt.Errorf("parse item html: %w", err)}
 	}
 	titleNode, bodyNode := findTitleAndBody(root)
 	title := strings.TrimSpace(textContent(titleNode))
@@ -192,6 +192,9 @@ func pullItem(ctx context.Context, client *http.Client, link string) itemEntry {
 		if err := html.Render(&buf, bodyNode); err == nil {
 			bodyHTML = buf.String()
 		}
+	}
+	if title == "" && bodyHTML == "" {
+		return itemEntry{Link: link, Err: errors.New("missing title and content")}
 	}
 
 	return itemEntry{Title: title, Payload: []byte(bodyHTML), Link: link}
@@ -227,11 +230,16 @@ func pullBatch(ctx context.Context, client *http.Client, links []string) []itemE
 func renderMarkdown(items []itemEntry) string {
 	stamp := timetag(time.Time{})
 	var b strings.Builder
+	failed := make([]itemEntry, 0, len(items))
 	b.WriteString("- 时间：")
 	b.WriteString(stamp)
 	b.WriteString("\n")
 
 	for _, item := range items {
+		if item.Err != nil {
+			failed = append(failed, item)
+			continue
+		}
 		title := strings.TrimSpace(item.Title)
 		if title == "" || strings.Contains(title, "新闻联播") {
 			continue
@@ -343,6 +351,15 @@ func (a *app) processDay(ctx context.Context, day string) error {
 	items := pullBatch(ctx, a.client, links)
 	if len(items) == 0 {
 		return nil
+	}
+	failedCount := 0
+	for _, item := range items {
+		if item.Err != nil {
+			failedCount++
+		}
+	}
+	if failedCount > 0 {
+		fmt.Fprintf(os.Stderr, "warning: day %s item fetch failures: %d/%d\n", day, failedCount, len(items))
 	}
 
 	content := formatMarkdown([]byte(renderMarkdown(items)))
@@ -483,6 +500,10 @@ func collectLinks(root *html.Node, baseURL string) ([]string, error) {
 				return false
 			}
 			if resolved.Host == "" {
+				return false
+			}
+			host := strings.ToLower(resolved.Hostname())
+			if host != "tv.cctv.com" && host != "news.cctv.com" && !strings.HasSuffix(host, ".cctv.com") {
 				return false
 			}
 			absolute := resolved.String()

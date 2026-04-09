@@ -13,6 +13,7 @@ The software herein is licensed under the [MIT](./LICENSE) by [@iantsysog](https
 ## Schedule
 
 <!-- INSERT -->
+- [20260409](./2026/20260409.md)
 - [20260408](./2026/20260408.md)
 - [20260407](./2026/20260407.md)
 - [20260406](./2026/20260406.md)

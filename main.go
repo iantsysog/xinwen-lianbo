@@ -60,16 +60,16 @@ var (
 )
 
 type itemEntry struct {
-	Title   string
-	Payload []byte
-	Link    string
 	Err     error
+	Title   string
+	Link    string
+	Payload []byte
 }
 
 type app struct {
+	client     *http.Client
 	rootDir    string
 	readmePath string
-	client     *http.Client
 }
 
 func mustAbs(path string) string {
@@ -148,7 +148,7 @@ func pullBytes(ctx context.Context, client *http.Client, target string) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return readResponseBody(resp)
 }
 
@@ -230,14 +230,12 @@ func pullBatch(ctx context.Context, client *http.Client, links []string) []itemE
 func renderMarkdown(items []itemEntry) string {
 	stamp := timetag(time.Time{})
 	var b strings.Builder
-	failed := make([]itemEntry, 0, len(items))
 	b.WriteString("- 时间：")
 	b.WriteString(stamp)
 	b.WriteString("\n")
 
 	for _, item := range items {
 		if item.Err != nil {
-			failed = append(failed, item)
 			continue
 		}
 		title := strings.TrimSpace(item.Title)
@@ -725,7 +723,7 @@ func writeFileAtomic(path string, data []byte, perm fs.FileMode) error {
 	if err != nil {
 		return nil
 	}
-	defer df.Close()
+	defer func() { _ = df.Close() }()
 	_ = df.Sync()
 	return nil
 }
